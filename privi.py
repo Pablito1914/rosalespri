@@ -98,6 +98,10 @@ def load_participants_from_db():
         if col not in df.columns:
             df[col] = 0
         df[col] = df[col].fillna(0).astype(int)
+    if "historial_meses" not in df.columns:
+        df["historial_meses"] = [{} for _ in range(len(df))]
+    else:
+        df["historial_meses"] = df["historial_meses"].apply(lambda x: x if isinstance(x, dict) else {})
     return df
 
 def save_participant_to_db(row_dict):
@@ -298,10 +302,21 @@ def confirmar_y_avanzar_semana(fecha_vym, fecha_fds):
             if nombre not in ["-- Seleccionar Manualmente --", "Ninguno (Dejar en blanco)"]:
                 nombres_usados.append(nombre)
 
+    mes_key = f"{fecha_vym.year}-{fecha_vym.month:02d}"
+
     for nombre in set(nombres_usados):
-        df.loc[df['Nombre'] == nombre, 'Total_Asignaciones'] += nombres_usados.count(nombre)
+        cantidad = nombres_usados.count(nombre)
+        df.loc[df['Nombre'] == nombre, 'Total_Asignaciones'] += cantidad
         df.loc[df['Nombre'] == nombre, 'Ultima_Ronda'] = ronda
         
+        # Actualizar historial por mes
+        idx = df[df['Nombre'] == nombre].index[0]
+        hist = df.at[idx, 'historial_meses']
+        if not isinstance(hist, dict):
+            hist = {}
+        hist[mes_key] = hist.get(mes_key, 0) + cantidad
+        df.at[idx, 'historial_meses'] = hist
+
         # Sincronizar este hermano a Firebase
         if not df[df['Nombre'] == nombre].empty:
             row_dict = df[df['Nombre'] == nombre].iloc[0].to_dict()
@@ -709,7 +724,34 @@ if st.session_state.role == "admin":
             c1, c2 = st.columns(2)
             c1.metric("Personal Activo", df_m['Activo'].sum())
             c2.metric("Servicios Acumulados Históricos", df_m['Total_Asignaciones'].sum())
+            
+            st.subheader("Total Histórico")
             st.bar_chart(data=df_sorted, x="Nombre", y="Total_Asignaciones", color="#319795")
+            
+            st.subheader("Asignaciones por Mes")
+            meses_disponibles = set()
+            for hist in df_m.get('historial_meses', []):
+                if isinstance(hist, dict):
+                    meses_disponibles.update(hist.keys())
+            
+            if meses_disponibles:
+                meses_disponibles = sorted(list(meses_disponibles), reverse=True)
+                mes_seleccionado = st.selectbox("Seleccione el mes (Año-Mes)", meses_disponibles)
+                
+                df_mes = df_m[['Nombre']].copy()
+                df_mes['Asignaciones_Este_Mes'] = df_m['historial_meses'].apply(
+                    lambda x: x.get(mes_seleccionado, 0) if isinstance(x, dict) else 0
+                )
+                # Filtrar solo los que tuvieron asignaciones ese mes
+                df_mes = df_mes[df_mes['Asignaciones_Este_Mes'] > 0].sort_values(by="Asignaciones_Este_Mes", ascending=False)
+                
+                if not df_mes.empty:
+                    st.dataframe(df_mes, use_container_width=True, hide_index=True)
+                    st.bar_chart(data=df_mes, x="Nombre", y="Asignaciones_Este_Mes", color="#F6AD55")
+                else:
+                    st.info(f"No hay asignaciones registradas en {mes_seleccionado}.")
+            else:
+                st.info("Aún no hay registros de asignaciones por mes. A medida que confirmes semanas, irán apareciendo aquí.")
 
     with tab4:
         st.header("🛠️ Panel de Administración")

@@ -28,15 +28,23 @@ st.set_page_config(page_title="Planificador de Asignaciones", page_icon="📅", 
 # -----------------------------------------------------------------------------
 import firebase_admin
 from firebase_admin import credentials, firestore
+import json
 
-try:
-    if not firebase_admin._apps:
-        cred = credentials.Certificate('firebase_credentials.json')
+# Conexión a la base de datos Firestore
+if not firebase_admin._apps:
+    try:
+        # Intentar leer desde Streamlit Secrets (Producción en la nube)
+        if "FIREBASE_JSON" in st.secrets:
+            cred_dict = json.loads(st.secrets["FIREBASE_JSON"])
+            cred = credentials.Certificate(cred_dict)
+        else:
+            # Leer desde el archivo local (Desarrollo)
+            cred = credentials.Certificate('firebase_credentials.json')
         firebase_admin.initialize_app(cred)
-    db = firestore.client()
-except Exception as e:
-    st.error("Error conectando a Firebase. Verifica tu firebase_credentials.json")
-    st.stop()
+    except Exception as e:
+        st.error(f"Error de credenciales Firebase: {e}")
+        st.stop()
+db = firestore.client()
 
 # -----------------------------------------------------------------------------
 # CONSTANTES, ROLES Y CONFIGURACIONES

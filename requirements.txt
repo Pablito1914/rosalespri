@@ -1,7 +1,7 @@
-streamlit==1.38.0
-pandas==2.2.2
-firebase-admin==6.5.0
-pypdf==4.3.1
-pytesseract==0.3.10
-Pillow==10.4.0
-reportlab==4.2.2
+streamlit
+pandas
+firebase-admin
+pypdf
+pytesseract
+Pillow
+reportlab

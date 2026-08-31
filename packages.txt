@@ -1,2 +1,5 @@
 tesseract-ocr
 tesseract-ocr-spa
+zlib1g-dev
+libjpeg-dev
+python3-dev

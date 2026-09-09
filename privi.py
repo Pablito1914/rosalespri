@@ -51,8 +51,6 @@ db = firestore.client()
 # CONSTANTES, ROLES Y CONFIGURACIONES
 # -----------------------------------------------------------------------------
 ROLES_VYM = {
-    "Presidente (Entre Semana)": "Presidente",
-    "Lector de Congregación (Entre Semana)": "Lector",
     "Micrófono 1 (Entre Semana)": "Micrófonos",
     "Micrófono 2 (Entre Semana)": "Micrófonos",
     "Acomodador Entrada 1 (E. Semana)": "Acomodador Entrada",

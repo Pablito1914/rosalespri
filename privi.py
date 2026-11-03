@@ -270,10 +270,27 @@ def normalizar_texto(t):
     sin_acentos = "".join(c for c in t_norm if not unicodedata.combining(c)).lower()
     return " ".join(sin_acentos.split())
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner="Inicializando lector óptico de imágenes (solo la primera vez)...")
 def _get_rapidocr_engine():
     try:
+        from rapidocr import RapidOCR
+        return RapidOCR()
+    except Exception:
+        pass
+    try:
         from rapidocr_onnxruntime import RapidOCR
+        return RapidOCR()
+    except Exception:
+        pass
+    # Autoinstalación en caliente si Streamlit Cloud aún no reinició el entorno
+    try:
+        import subprocess
+        import sys
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "--quiet",
+            "rapidocr", "onnxruntime", "opencv-python-headless"
+        ])
+        from rapidocr import RapidOCR
         return RapidOCR()
     except Exception:
         return None
@@ -292,38 +309,20 @@ def _ocr_imagen_automatico(image):
         except Exception:
             pass
 
-    # 2. Intentar con RapidOCR (motor nativo Python sin dependencias de sistema)
+    # 2. Intentar con RapidOCR (motor nativo Python compatible con Python 3.13 y Linux)
     engine = _get_rapidocr_engine()
     if engine is not None:
         try:
             img_rgb = np.array(image.convert("RGB"))
-            result, _ = engine(img_rgb)
-            if result:
-                return "\n".join([line[1] for line in result])
-        except Exception:
-            pass
-
-    # 3. Respaldo automático en la nube (OCR API) si aún no carga el motor local
-    try:
-        buf = io.BytesIO()
-        img_copy = image.convert("RGB")
-        img_copy.thumbnail((1600, 1600))
-        img_copy.save(buf, format="JPEG", quality=82)
-        b64_img = base64.b64encode(buf.getvalue()).decode("utf-8")
-        payload = urllib.parse.urlencode({
-            "apikey": "helloworld",
-            "base64Image": f"data:image/jpeg;base64,{b64_img}",
-            "language": "spa",
-            "OCREngine": "2"
-        }).encode("utf-8")
-        req = urllib.request.Request("https://api.ocr.space/parse/image", data=payload)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resp_data = json.loads(resp.read().decode("utf-8"))
-            parsed = resp_data.get("ParsedResults", [])
-            if parsed:
-                return "\n".join(p.get("ParsedText", "") for p in parsed)
-    except Exception as e:
-        st.error(f"No se pudo procesar la imagen automáticamente: {e}")
+            out = engine(img_rgb)
+            if hasattr(out, "txts") and out.txts:
+                return "\n".join(out.txts)
+            if isinstance(out, tuple) and out[0]:
+                return "\n".join([line[1] for line in out[0]])
+            if isinstance(out, list) and out:
+                return "\n".join([line[1] for line in out if isinstance(line, (list, tuple)) and len(line) > 1])
+        except Exception as e:
+            st.error(f"Error en motor OCR local: {e}")
 
     return ""
 

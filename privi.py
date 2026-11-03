@@ -24,28 +24,53 @@ from reportlab.lib import colors
 st.set_page_config(page_title="Planificador de Asignaciones", page_icon="📅", layout="wide")
 
 # -----------------------------------------------------------------------------
-# FIREBASE & AUTENTICACIÓN
+# FIREBASE & AUTENTICACIÓN (OPTIMIZADO CON CACHÉ PARA ACCESO RÁPIDO)
 # -----------------------------------------------------------------------------
 import firebase_admin
 from firebase_admin import credentials, firestore
 import json
+import hashlib
+import hmac
 
-# Conexión a la base de datos Firestore
-if not firebase_admin._apps:
-    try:
-        # Intentar leer desde Streamlit Secrets (Producción en la nube)
-        if "FIREBASE_JSON" in st.secrets:
-            # strict=False permite que los saltos de línea literales en la llave privada se lean correctamente
-            cred_dict = json.loads(st.secrets["FIREBASE_JSON"], strict=False)
-            cred = credentials.Certificate(cred_dict)
-        else:
-            # Leer desde el archivo local (Desarrollo)
-            cred = credentials.Certificate('firebase_credentials.json')
+@st.cache_resource(show_spinner=False)
+def init_firebase():
+    if "FIREBASE_JSON" in st.secrets:
+        raw_secret = st.secrets["FIREBASE_JSON"]
+        cred_dict = json.loads(raw_secret, strict=False)
+        cred = credentials.Certificate(cred_dict)
+    else:
+        with open('firebase_credentials.json', 'r', encoding='utf-8') as f:
+            raw_secret = f.read()
+        cred = credentials.Certificate('firebase_credentials.json')
+    if not firebase_admin._apps:
         firebase_admin.initialize_app(cred)
-    except Exception as e:
-        st.error(f"Error de credenciales Firebase: {e}")
-        st.stop()
-db = firestore.client()
+    secret_key = hashlib.sha256(raw_secret.encode('utf-8')).hexdigest()
+    return firestore.client(), secret_key
+
+try:
+    db, SECRET_KEY = init_firebase()
+except Exception as e:
+    st.error(f"Error de credenciales Firebase: {e}")
+    st.stop()
+
+def generar_token_sesion(username, role):
+    payload = f"{username}|{role}"
+    firma = hmac.new(SECRET_KEY.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()[:16]
+    return f"{username}|{role}|{firma}"
+
+def verificar_token_sesion(token):
+    try:
+        partes = token.split("|")
+        if len(partes) != 3:
+            return None, None
+        username, role, firma = partes
+        payload = f"{username}|{role}"
+        firma_esperada = hmac.new(SECRET_KEY.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()[:16]
+        if hmac.compare_digest(firma, firma_esperada):
+            return username, role
+    except Exception:
+        pass
+    return None, None
 
 # -----------------------------------------------------------------------------
 # CONSTANTES, ROLES Y CONFIGURACIONES
@@ -82,12 +107,38 @@ QUALIFICATIONS = list(set(list(ROLES_VYM.values()) + list(ROLES_FDS.values()) + 
 # -----------------------------------------------------------------------------
 # CARGA DE BASE DE DATOS FIRESTORE Y ESTADO DE SESIÓN MULTI-SEMANA
 # -----------------------------------------------------------------------------
-def load_participants_from_db():
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_participants_data():
     docs = db.collection('participantes').stream()
-    data = [doc.to_dict() for doc in docs]
+    return [doc.to_dict() for doc in docs]
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _fetch_users_data():
+    usuarios_docs = db.collection('usuarios').stream()
+    return [doc.to_dict() for doc in usuarios_docs]
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _fetch_audit_logs():
+    logs = db.collection('auditoria').order_by('timestamp', direction=firestore.Query.DESCENDING).limit(50).stream()
+    logs_data = []
+    for l in logs:
+        ld = l.to_dict()
+        if 'timestamp' in ld and ld['timestamp']:
+            fecha_str = ld['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            fecha_str = "Reciente"
+        logs_data.append({
+            'Fecha': fecha_str,
+            'usuario': ld.get('usuario', ''),
+            'accion': ld.get('accion', '')
+        })
+    return logs_data
+
+def load_participants_from_db():
+    data = _fetch_participants_data()
     if not data:
         return pd.DataFrame(columns=["Nombre", "Activo"] + QUALIFICATIONS + ["Total_Asignaciones", "Ultima_Ronda"])
-    df = pd.DataFrame(data)
+    df = pd.DataFrame([d.copy() for d in data])
     for col in ["Activo"] + QUALIFICATIONS:
         if col not in df.columns:
             df[col] = False
@@ -99,7 +150,7 @@ def load_participants_from_db():
     if "historial_meses" not in df.columns:
         df["historial_meses"] = [{} for _ in range(len(df))]
     else:
-        df["historial_meses"] = df["historial_meses"].apply(lambda x: x if isinstance(x, dict) else {})
+        df["historial_meses"] = df["historial_meses"].apply(lambda x: dict(x) if isinstance(x, dict) else {})
     return df
 
 def save_participant_to_db(row_dict):
@@ -118,15 +169,21 @@ def log_audit(accion):
             'accion': accion,
             'timestamp': firestore.SERVER_TIMESTAMP
         })
+        _fetch_audit_logs.clear()
 
-if "participants" not in st.session_state:
-    st.session_state.participants = load_participants_from_db()
-
-# --- LOGIN ---
+# --- LOGIN Y SESIÓN RÁPIDA ---
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.role = None
     st.session_state.username = None
+
+# Restaurar sesión automáticamente si existe token firmado en la URL
+if not st.session_state.logged_in and "auth" in st.query_params:
+    t_user, t_role = verificar_token_sesion(st.query_params["auth"])
+    if t_user and t_role:
+        st.session_state.logged_in = True
+        st.session_state.username = t_user
+        st.session_state.role = t_role
 
 if not st.session_state.logged_in:
     st.title("🔐 Sistema de Asignaciones")
@@ -136,15 +193,20 @@ if not st.session_state.logged_in:
         with st.form("login_form"):
             username = st.text_input("Usuario")
             password = st.text_input("Contraseña", type="password")
+            recordar = st.checkbox("⚡ Mantener sesión iniciada (Acceso rápido)", value=True)
             submitted = st.form_submit_button("Entrar", use_container_width=True)
             if submitted:
-                user_doc = db.collection('usuarios').document(username).get()
+                username_clean = username.strip()
+                user_doc = db.collection('usuarios').document(username_clean).get()
                 if user_doc.exists:
                     user_data = user_doc.to_dict()
                     if user_data.get('password') == password:
+                        role_val = user_data.get('role', 'usuario')
                         st.session_state.logged_in = True
-                        st.session_state.role = user_data.get('role', 'usuario')
-                        st.session_state.username = username
+                        st.session_state.role = role_val
+                        st.session_state.username = username_clean
+                        if recordar:
+                            st.query_params["auth"] = generar_token_sesion(username_clean, role_val)
                         log_audit("Inició sesión")
                         st.rerun()
                     else:
@@ -152,6 +214,9 @@ if not st.session_state.logged_in:
                 else:
                     st.error("Usuario no encontrado")
     st.stop()
+
+if "participants" not in st.session_state:
+    st.session_state.participants = load_participants_from_db()
     
 # --- LOGOUT BTN ---
 c_title, c_user = st.columns([4,1])
@@ -162,6 +227,7 @@ with c_user:
         st.session_state.logged_in = False
         st.session_state.role = None
         st.session_state.username = None
+        st.query_params.clear()
         st.rerun()
 
 if "ronda_actual" not in st.session_state:
@@ -306,6 +372,7 @@ def confirmar_y_avanzar_semana(fecha_vym, fecha_fds):
     if 'historial_meses' not in df.columns:
         df['historial_meses'] = [{} for _ in range(len(df))]
 
+    batch = db.batch()
     for nombre in set(nombres_usados):
         cantidad = nombres_usados.count(nombre)
         df.loc[df['Nombre'] == nombre, 'Total_Asignaciones'] += cantidad
@@ -319,10 +386,15 @@ def confirmar_y_avanzar_semana(fecha_vym, fecha_fds):
         hist[mes_key] = hist.get(mes_key, 0) + cantidad
         df.at[idx, 'historial_meses'] = hist
 
-        # Sincronizar este hermano a Firebase
+        # Agregar actualización al lote (batch) de Firebase
         if not df[df['Nombre'] == nombre].empty:
             row_dict = df[df['Nombre'] == nombre].iloc[0].to_dict()
-            save_participant_to_db(row_dict)
+            doc_id = row_dict['Nombre'].replace(' ', '_').replace('/', '_')
+            batch.set(db.collection('participantes').document(doc_id), row_dict)
+            
+    if nombres_usados:
+        batch.commit()
+        _fetch_participants_data.clear()
         
     st.session_state.participants = df
 
@@ -341,6 +413,7 @@ def confirmar_y_avanzar_semana(fecha_vym, fecha_fds):
     st.session_state.draft_ready = False
     st.session_state.texto_programa = ""
     st.session_state.nombres_detectados_vm = []
+    st.session_state.ultimo_archivo_id = None
 
     if st.session_state.current_week > st.session_state.target_weeks:
         st.session_state.plan_mode = "completed"
@@ -508,10 +581,13 @@ with tab1:
             nombres_activos = st.session_state.participants[st.session_state.participants["Activo"] == True]['Nombre'].tolist()
             
             if archivo_vm:
-                st.session_state.texto_programa = extraer_texto_archivo(archivo_vm)
-                encontrados = [n for n in nombres_activos if n.lower() in st.session_state.texto_programa.lower()]
-                st.session_state.nombres_detectados_vm = encontrados
-                st.success(f"Se detectaron {len(encontrados)} hermanos.")
+                archivo_id = f"{archivo_vm.name}_{archivo_vm.size}_{st.session_state.current_week}"
+                if st.session_state.get("ultimo_archivo_id") != archivo_id:
+                    st.session_state.texto_programa = extraer_texto_archivo(archivo_vm)
+                    encontrados = [n for n in nombres_activos if n.lower() in st.session_state.texto_programa.lower()]
+                    st.session_state.nombres_detectados_vm = encontrados
+                    st.session_state.ultimo_archivo_id = archivo_id
+                st.success(f"Se detectaron {len(st.session_state.nombres_detectados_vm)} hermanos.")
                 
             excluidos = st.multiselect(
                 "Personas excluidas para esta semana (No se les asignará nada):", 
@@ -705,15 +781,20 @@ if st.session_state.role == "admin":
         )
         if st.button("💾 Guardar Base de Datos Manualmente (Nube)"):
             nombres_nuevos = set(edited_df['Nombre'].dropna().tolist())
+            batch = db.batch()
             docs = db.collection('participantes').stream()
             for doc in docs:
                 if doc.to_dict().get('Nombre') not in nombres_nuevos:
-                    db.collection('participantes').document(doc.id).delete()
+                    batch.delete(db.collection('participantes').document(doc.id))
                     
             for _, row in edited_df.iterrows():
                 if pd.notna(row['Nombre']) and str(row['Nombre']).strip() != "":
-                    save_participant_to_db(row.to_dict())
+                    row_dict = row.to_dict()
+                    doc_id = row_dict['Nombre'].replace(' ', '_').replace('/', '_')
+                    batch.set(db.collection('participantes').document(doc_id), row_dict)
                     
+            batch.commit()
+            _fetch_participants_data.clear()
             st.session_state.participants = edited_df.copy()
             log_audit("Actualizó la base de datos de hermanos")
             st.toast("¡Datos sincronizados con la nube!", icon="✅")
@@ -759,8 +840,7 @@ if st.session_state.role == "admin":
         st.header("🛠️ Panel de Administración")
         
         st.subheader("👥 Gestión de Usuarios")
-        usuarios_docs = db.collection('usuarios').stream()
-        usuarios_data = [doc.to_dict() for doc in usuarios_docs]
+        usuarios_data = _fetch_users_data()
         if usuarios_data:
             df_users = pd.DataFrame(usuarios_data)
             st.dataframe(df_users[['username', 'role']])
@@ -777,6 +857,7 @@ if st.session_state.role == "admin":
                             'password': n_pass,
                             'role': n_role
                         })
+                        _fetch_users_data.clear()
                         log_audit(f"Creó o modificó al usuario {n_user}")
                         st.success("Usuario guardado en la nube.")
                         st.rerun()
@@ -786,18 +867,10 @@ if st.session_state.role == "admin":
         st.markdown("---")
         st.subheader("📜 Registro de Auditoría")
         if st.button("Actualizar Registro"):
+            _fetch_audit_logs.clear()
             st.rerun()
         
-        logs = db.collection('auditoria').order_by('timestamp', direction=firestore.Query.DESCENDING).limit(50).stream()
-        logs_data = []
-        for l in logs:
-            ld = l.to_dict()
-            if 'timestamp' in ld and ld['timestamp']:
-                ld['Fecha'] = ld['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                ld['Fecha'] = "Reciente"
-            logs_data.append(ld)
-            
+        logs_data = _fetch_audit_logs()
         if logs_data:
             st.dataframe(pd.DataFrame(logs_data)[['Fecha', 'usuario', 'accion']], use_container_width=True)
         else:

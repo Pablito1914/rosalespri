@@ -258,23 +258,89 @@ def obtener_fecha_espanol(fecha_obj):
 def limpiar_texto_rol(texto):
     return texto.split('(')[0].strip()
 
+import unicodedata
+import urllib.request
+import urllib.parse
+import base64
+
+def normalizar_texto(t):
+    if not t:
+        return ""
+    t_norm = unicodedata.normalize('NFKD', str(t))
+    sin_acentos = "".join(c for c in t_norm if not unicodedata.combining(c)).lower()
+    return " ".join(sin_acentos.split())
+
+@st.cache_resource(show_spinner=False)
+def _get_rapidocr_engine():
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        return RapidOCR()
+    except Exception:
+        return None
+
+def _ocr_imagen_automatico(image):
+    # 1. Intentar con Tesseract local/servidor si está disponible
+    try:
+        txt = pytesseract.image_to_string(image, lang='spa+eng')
+        if txt and txt.strip():
+            return txt
+    except Exception:
+        try:
+            txt = pytesseract.image_to_string(image)
+            if txt and txt.strip():
+                return txt
+        except Exception:
+            pass
+
+    # 2. Intentar con RapidOCR (motor nativo Python sin dependencias de sistema)
+    engine = _get_rapidocr_engine()
+    if engine is not None:
+        try:
+            img_rgb = np.array(image.convert("RGB"))
+            result, _ = engine(img_rgb)
+            if result:
+                return "\n".join([line[1] for line in result])
+        except Exception:
+            pass
+
+    # 3. Respaldo automático en la nube (OCR API) si aún no carga el motor local
+    try:
+        buf = io.BytesIO()
+        img_copy = image.convert("RGB")
+        img_copy.thumbnail((1600, 1600))
+        img_copy.save(buf, format="JPEG", quality=82)
+        b64_img = base64.b64encode(buf.getvalue()).decode("utf-8")
+        payload = urllib.parse.urlencode({
+            "apikey": "helloworld",
+            "base64Image": f"data:image/jpeg;base64,{b64_img}",
+            "language": "spa",
+            "OCREngine": "2"
+        }).encode("utf-8")
+        req = urllib.request.Request("https://api.ocr.space/parse/image", data=payload)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+            parsed = resp_data.get("ParsedResults", [])
+            if parsed:
+                return "\n".join(p.get("ParsedText", "") for p in parsed)
+    except Exception as e:
+        st.error(f"No se pudo procesar la imagen automáticamente: {e}")
+
+    return ""
+
 def extraer_texto_archivo(uploaded_file):
     texto = ""
     try:
         if uploaded_file.name.lower().endswith('.pdf'):
             reader = PdfReader(uploaded_file)
             for page in reader.pages:
-                texto += page.extract_text() + "\n"
+                texto += (page.extract_text() or "") + "\n"
         elif uploaded_file.name.lower().endswith('.csv'):
             texto = pd.read_csv(uploaded_file).to_string()
         elif uploaded_file.name.lower().endswith('.txt'):
             texto = uploaded_file.read().decode('utf-8')
         elif uploaded_file.name.lower().endswith(('.png', '.jpg', '.jpeg')):
-            try:
-                image = Image.open(uploaded_file)
-                texto = pytesseract.image_to_string(image, lang='spa+eng')
-            except pytesseract.pytesseract.TesseractNotFoundError:
-                st.error("⚠️ Para procesar imágenes necesitas instalar **Tesseract OCR** en tu sistema. Descárgalo en: https://github.com/UB-Mannheim/tesseract/wiki y asegúrate de agregarlo al PATH durante la instalación (o instálalo en la ruta por defecto).")
+            image = Image.open(uploaded_file)
+            texto = _ocr_imagen_automatico(image)
     except Exception as e:
         st.error(f"Error leyendo el archivo: {e}")
     return texto
@@ -584,7 +650,8 @@ with tab1:
                 archivo_id = f"{archivo_vm.name}_{archivo_vm.size}_{st.session_state.current_week}"
                 if st.session_state.get("ultimo_archivo_id") != archivo_id:
                     st.session_state.texto_programa = extraer_texto_archivo(archivo_vm)
-                    encontrados = [n for n in nombres_activos if n.lower() in st.session_state.texto_programa.lower()]
+                    texto_norm = normalizar_texto(st.session_state.texto_programa)
+                    encontrados = [n for n in nombres_activos if normalizar_texto(n) and normalizar_texto(n) in texto_norm]
                     st.session_state.nombres_detectados_vm = encontrados
                     st.session_state.ultimo_archivo_id = archivo_id
                 st.success(f"Se detectaron {len(st.session_state.nombres_detectados_vm)} hermanos.")

@@ -5,3 +5,4 @@ pypdf
 pytesseract
 Pillow
 reportlab
+rapidocr-onnxruntime

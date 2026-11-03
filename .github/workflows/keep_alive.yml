@@ -2,15 +2,15 @@ name: Keep Streamlit App Awake
 
 on:
   schedule:
-    # Ejecuta cada 30 minutos para evitar que Streamlit Cloud duerma la app
-    - cron: '*/30 * * * *'
+    # Ejecuta cada 25 minutos para mantener el contenedor activo
+    - cron: '*/25 * * * *'
   workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Streamlit App and Health Endpoint
+      - name: Ping Direct Streamlit Endpoints
         run: |
-          curl -s -L -A "Mozilla/5.0" https://rosalesv1.streamlit.app/ > /dev/null || true
-          curl -s -L -A "Mozilla/5.0" https://rosalesv1.streamlit.app/_stcore/health || true
+          curl -s -L -b cookies.txt -c cookies.txt -A "Mozilla/5.0" https://rosalesv1.streamlit.app/~/+/_stcore/health || true
+          curl -s -L -b cookies.txt -c cookies.txt -A "Mozilla/5.0" https://rosalesv1.streamlit.app/~/+/ > /dev/null || true

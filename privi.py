@@ -240,12 +240,15 @@ if "current_week" not in st.session_state: st.session_state.current_week = 1
 if "history_vym" not in st.session_state: st.session_state.history_vym = []
 if "history_fds" not in st.session_state: st.session_state.history_fds = []
 if "history_av" not in st.session_state: st.session_state.history_av = []
+if "history_mes_keys" not in st.session_state: st.session_state.history_mes_keys = []
 
 if "draft_ready" not in st.session_state: st.session_state.draft_ready = False
 if "texto_programa" not in st.session_state: st.session_state.texto_programa = ""
 if "nombres_detectados_vm" not in st.session_state: st.session_state.nombres_detectados_vm = []
 if "default_vym_date" not in st.session_state: st.session_state.default_vym_date = datetime.date.today()
 if "default_fds_date" not in st.session_state: st.session_state.default_fds_date = datetime.date.today() + datetime.timedelta(days=5)
+
+_fragment = getattr(st, "fragment", getattr(st, "experimental_fragment", lambda f: f))
 
 # -----------------------------------------------------------------------------
 # FUNCIONES ALGORÍTMICAS Y DE FORMATO
@@ -406,15 +409,169 @@ def generar_propuestas(excluidos):
 
 def obtener_opciones_combo_inteligente(cualificacion, nombres_asignados_actualmente):
     df = st.session_state.participants
-    candidatos = df[(df['Activo'] == True) & (df[cualificacion] == True) & (~df['Nombre'].isin(nombres_asignados_actualmente))].copy()
-    candidatos = candidatos.sort_values(by=['Total_Asignaciones', 'Ultima_Ronda'], ascending=[True, True])
-    
-    recomendados = []
-    
-    for _, row in candidatos.iterrows():
-        recomendados.append(row['Nombre'])
-            
-    return ["-- Seleccionar Manualmente --", "Ninguno (Dejar en blanco)"], recomendados
+    if df.empty or cualificacion not in df.columns:
+        return ["-- Seleccionar Manualmente --", "Ninguno (Dejar en blanco)"], []
+    mask = (df['Activo'] == True) & (df[cualificacion] == True) & (~df['Nombre'].isin(nombres_asignados_actualmente))
+    candidatos = df.loc[mask].sort_values(by=['Total_Asignaciones', 'Ultima_Ronda'], ascending=[True, True])
+    return ["-- Seleccionar Manualmente --", "Ninguno (Dejar en blanco)"], candidatos['Nombre'].tolist()
+
+def mostrar_previsualizacion_semana(fecha_vym_str, dict_vym, fecha_fds_str, dict_fds, fecha_av_str, dict_av):
+    """Muestra en pantalla la vista previa estructurada de las asignaciones tal como saldrán en el documento final."""
+    def _formatear_df(diccionario):
+        filas = []
+        for k, v in diccionario.items():
+            valor_mostrar = "— (En blanco)" if v in ["", "-- Seleccionar Manualmente --", "Ninguno (Dejar en blanco)"] else v
+            filas.append({"Privilegio / Rol": limpiar_texto_rol(k), "Asignado a:": valor_mostrar})
+        return pd.DataFrame(filas)
+
+    c_vym, c_fds = st.columns(2)
+    with c_vym:
+        st.markdown(f"**💼 VIDA Y MINISTERIO** — *{fecha_vym_str}*")
+        st.dataframe(_formatear_df(dict_vym), use_container_width=True, hide_index=True)
+        st.markdown(f"**🎛️ AUDIO Y VIDEO** — *{fecha_av_str}*")
+        st.dataframe(_formatear_df(dict_av), use_container_width=True, hide_index=True)
+    with c_fds:
+        st.markdown(f"**⛪ REUNIÓN DE FIN DE SEMANA** — *{fecha_fds_str}*")
+        st.dataframe(_formatear_df(dict_fds), use_container_width=True, hide_index=True)
+
+def corregir_asignaciones_semana_confirmada(idx_sem, nueva_fecha_vym, nuevo_vym, nueva_fecha_fds, nuevo_fds, nueva_fecha_av, nuevo_av):
+    """Actualiza una semana ya confirmada y ajusta automáticamente el conteo en Firebase si cambió algún hermano."""
+    df = st.session_state.participants
+    _, viejo_vym = st.session_state.history_vym[idx_sem]
+    _, viejo_fds = st.session_state.history_fds[idx_sem]
+    _, viejo_av = st.session_state.history_av[idx_sem]
+
+    viejos_usados = [
+        n for d in (viejo_vym, viejo_fds, viejo_av)
+        for n in d.values()
+        if n not in ["", "-- Seleccionar Manualmente --", "Ninguno (Dejar en blanco)"]
+    ]
+    nuevos_usados = [
+        n for d in (nuevo_vym, nuevo_fds, nuevo_av)
+        for n in d.values()
+        if n not in ["", "-- Seleccionar Manualmente --", "Ninguno (Dejar en blanco)"]
+    ]
+
+    mes_key = None
+    if "history_mes_keys" in st.session_state and idx_sem < len(st.session_state.history_mes_keys):
+        mes_key = st.session_state.history_mes_keys[idx_sem]
+
+    todos_involucrados = set(viejos_usados) | set(nuevos_usados)
+    batch = db.batch()
+    hubo_cambios_db = False
+
+    for nombre in todos_involucrados:
+        delta = nuevos_usados.count(nombre) - viejos_usados.count(nombre)
+        if delta != 0 and not df[df['Nombre'] == nombre].empty:
+            idx = df[df['Nombre'] == nombre].index[0]
+            nuevo_total = max(0, int(df.at[idx, 'Total_Asignaciones']) + delta)
+            df.at[idx, 'Total_Asignaciones'] = nuevo_total
+
+            if mes_key and 'historial_meses' in df.columns:
+                hist = df.at[idx, 'historial_meses']
+                if not isinstance(hist, dict):
+                    hist = {}
+                hist[mes_key] = max(0, int(hist.get(mes_key, 0)) + delta)
+                df.at[idx, 'historial_meses'] = hist
+
+            row_dict = df.loc[idx].to_dict()
+            doc_id = row_dict['Nombre'].replace(' ', '_').replace('/', '_')
+            batch.set(db.collection('participantes').document(doc_id), row_dict)
+            hubo_cambios_db = True
+
+    if hubo_cambios_db:
+        batch.commit()
+        _fetch_participants_data.clear()
+        st.session_state.participants = df
+
+    st.session_state.history_vym[idx_sem] = (nueva_fecha_vym, nuevo_vym)
+    st.session_state.history_fds[idx_sem] = (nueva_fecha_fds, nuevo_fds)
+    st.session_state.history_av[idx_sem] = (nueva_fecha_av, nuevo_av)
+    log_audit(f"Corrigió asignaciones de la Semana {idx_sem + 1} ({nueva_fecha_vym})")
+
+def render_panel_previsualizacion_y_correccion_historial(expandir_por_defecto=True):
+    """Muestra la previsualización de todas las semanas confirmadas y permite corregir cualquier error en caliente."""
+    if not st.session_state.history_vym:
+        return
+
+    nombres_activos = sorted(
+        st.session_state.participants[st.session_state.participants["Activo"] == True]['Nombre'].tolist()
+    )
+    opciones_edicion = ["Ninguno (Dejar en blanco)"] + nombres_activos
+
+    for idx_sem in range(len(st.session_state.history_vym)):
+        f_vym, d_vym = st.session_state.history_vym[idx_sem]
+        f_fds, d_fds = st.session_state.history_fds[idx_sem]
+        f_av, d_av = st.session_state.history_av[idx_sem]
+
+        with st.expander(f"👁️ Semana {idx_sem + 1}: {f_vym} al {f_fds} (Previsualización y Corrección)", expanded=expandir_por_defecto):
+            mostrar_previsualizacion_semana(f_vym, d_vym, f_fds, d_fds, f_av, d_av)
+
+            with st.expander(f"✏️ Corregir / Modificar Asignaciones de la Semana {idx_sem + 1}", expanded=False):
+                with st.form(key=f"form_corregir_sem_{idx_sem}"):
+                    st.caption("Modifica cualquier asignación o fecha donde hayas detectado un error y presiona **Guardar Corrección**.")
+                    cf1, cf2 = st.columns(2)
+                    edit_f_vym = cf1.text_input("Fecha Vida y Ministerio:", value=f_vym, key=f"ef_vym_{idx_sem}")
+                    edit_f_fds = cf2.text_input("Fecha Fin de Semana:", value=f_fds, key=f"ef_fds_{idx_sem}")
+
+                    st.markdown("**🎛️ Audio y Video**")
+                    cav1, cav2 = st.columns(2)
+                    nuevo_av = {}
+                    for i_r, rol in enumerate(ROLES_AV.keys()):
+                        val_act = d_av.get(rol, "Ninguno (Dejar en blanco)")
+                        if val_act == "-- Seleccionar Manualmente --" or val_act not in opciones_edicion:
+                            opts_rol = [val_act] + opciones_edicion if val_act and val_act != "-- Seleccionar Manualmente --" else opciones_edicion
+                        else:
+                            opts_rol = opciones_edicion
+                        idx_sel = opts_rol.index(val_act) if val_act in opts_rol else 0
+                        nuevo_av[rol] = (cav1 if i_r % 2 == 0 else cav2).selectbox(
+                            limpiar_texto_rol(rol),
+                            options=opts_rol,
+                            index=idx_sel,
+                            key=f"edit_av_{idx_sem}_{rol}"
+                        )
+
+                    st.markdown("**💼 Reunión Vida y Ministerio**")
+                    cvym1, cvym2 = st.columns(2)
+                    nuevo_vym = {}
+                    for i_r, rol in enumerate(ROLES_VYM.keys()):
+                        val_act = d_vym.get(rol, "Ninguno (Dejar en blanco)")
+                        if val_act == "-- Seleccionar Manualmente --" or val_act not in opciones_edicion:
+                            opts_rol = [val_act] + opciones_edicion if val_act and val_act != "-- Seleccionar Manualmente --" else opciones_edicion
+                        else:
+                            opts_rol = opciones_edicion
+                        idx_sel = opts_rol.index(val_act) if val_act in opts_rol else 0
+                        nuevo_vym[rol] = (cvym1 if i_r % 2 == 0 else cvym2).selectbox(
+                            limpiar_texto_rol(rol),
+                            options=opts_rol,
+                            index=idx_sel,
+                            key=f"edit_vym_{idx_sem}_{rol}"
+                        )
+
+                    st.markdown("**⛪ Reunión de Fin de Semana**")
+                    cfds1, cfds2 = st.columns(2)
+                    nuevo_fds = {}
+                    for i_r, rol in enumerate(ROLES_FDS.keys()):
+                        val_act = d_fds.get(rol, "Ninguno (Dejar en blanco)")
+                        if val_act == "-- Seleccionar Manualmente --" or val_act not in opciones_edicion:
+                            opts_rol = [val_act] + opciones_edicion if val_act and val_act != "-- Seleccionar Manualmente --" else opciones_edicion
+                        else:
+                            opts_rol = opciones_edicion
+                        idx_sel = opts_rol.index(val_act) if val_act in opts_rol else 0
+                        nuevo_fds[rol] = (cfds1 if i_r % 2 == 0 else cfds2).selectbox(
+                            limpiar_texto_rol(rol),
+                            options=opts_rol,
+                            index=idx_sel,
+                            key=f"edit_fds_{idx_sem}_{rol}"
+                        )
+
+                    if st.form_submit_button(f"✅ Guardar Corrección de la Semana {idx_sem + 1}", type="primary", use_container_width=True):
+                        edit_f_av = f"Semana del {edit_f_vym}"
+                        corregir_asignaciones_semana_confirmada(
+                            idx_sem, edit_f_vym, nuevo_vym, edit_f_fds, nuevo_fds, edit_f_av, nuevo_av
+                        )
+                        st.toast(f"¡Semana {idx_sem + 1} corregida y actualizada!", icon="✅")
+                        st.rerun()
 
 def confirmar_y_avanzar_semana(fecha_vym, fecha_fds):
     df = st.session_state.participants
@@ -470,6 +627,7 @@ def confirmar_y_avanzar_semana(fecha_vym, fecha_fds):
     st.session_state.history_vym.append((str_fecha_vym, dict_vym))
     st.session_state.history_fds.append((str_fecha_fds, dict_fds))
     st.session_state.history_av.append((fecha_av, dict_av))
+    st.session_state.history_mes_keys.append(mes_key)
 
     st.session_state.current_week += 1
     st.session_state.default_vym_date = fecha_vym + datetime.timedelta(days=7)
@@ -601,9 +759,11 @@ def reiniciar_planificacion():
     st.session_state.history_vym = []
     st.session_state.history_fds = []
     st.session_state.history_av = []
+    st.session_state.history_mes_keys = []
     st.session_state.draft_ready = False
     st.session_state.texto_programa = ""
     st.session_state.nombres_detectados_vm = []
+    st.session_state.ultimo_archivo_id = None
 
 # -----------------------------------------------------------------------------
 # INTERFAZ GRÁFICA DE USUARIO (UI)
@@ -671,149 +831,175 @@ with tab1:
                     st.text_area("Contenido extraído del documento:", st.session_state.texto_programa, height=250, disabled=True)
                     
             if st.session_state.draft_ready:
-                st.write("### Paso 3: Revisar y Editar")
-                
-                # --- NUEVO DASHBOARD VISUAL ---
-                st.markdown("#### 📊 Resumen Visual de la Semana")
-                
-                asignados_dict = {}
-                # Recopilar todos los asignados actuales (ignorando "-- Seleccionar Manualmente --")
-                for cat_dict, prefix in [(ROLES_AV, "av"), (ROLES_VYM, "vym"), (ROLES_FDS, "fds")]:
-                    for rol in cat_dict.keys():
-                        widget_key = f'borrador_{prefix}_{rol}_{st.session_state.current_week}'
-                        val = st.session_state.get(widget_key, st.session_state.get(f'borrador_{prefix}_{rol}', ""))
-                        if val not in ["", "-- Seleccionar Manualmente --", "Ninguno (Dejar en blanco)"]:
-                            asignados_dict[f'{prefix}_{rol}'] = val
-                
-                asignados_actuales = set(asignados_dict.values())
-                
-                if asignados_actuales:
-                    st.info(f"**{len(asignados_actuales)} hermanos asignados para esta semana:**")
+                @_fragment
+                def _render_paso3_revisar_y_editar(fecha_vym_actual, fecha_fds_actual):
+                    st.write("### Paso 3: Revisar, Previsualizar y Editar")
                     
-                    persona_roles = {}
-                    for cat_name, cat_dict, prefix in [("A.y V.", ROLES_AV, "av"), ("V.y M.", ROLES_VYM, "vym"), ("F.de Sem.", ROLES_FDS, "fds")]:
+                    # --- NUEVO DASHBOARD VISUAL ---
+                    st.markdown("#### 📊 Resumen Visual de la Semana")
+                    
+                    asignados_dict = {}
+                    # Recopilar todos los asignados actuales (ignorando "-- Seleccionar Manualmente --")
+                    for cat_dict, prefix in [(ROLES_AV, "av"), (ROLES_VYM, "vym"), (ROLES_FDS, "fds")]:
                         for rol in cat_dict.keys():
-                            val = asignados_dict.get(f'{prefix}_{rol}', "")
-                            if val:
-                                if val not in persona_roles:
-                                    persona_roles[val] = []
-                                persona_roles[val].append(f"*{limpiar_texto_rol(rol)} ({cat_name})*")
+                            widget_key = f'borrador_{prefix}_{rol}_{st.session_state.current_week}'
+                            val = st.session_state.get(widget_key, st.session_state.get(f'borrador_{prefix}_{rol}', ""))
+                            if val not in ["", "-- Seleccionar Manualmente --", "Ninguno (Dejar en blanco)"]:
+                                asignados_dict[f'{prefix}_{rol}'] = val
                     
-                    cols_dash = st.columns(3)
-                    for i, (persona, roles) in enumerate(persona_roles.items()):
-                        roles_str = " | ".join(roles)
-                        if len(roles) > 1:
-                            cols_dash[i % 3].error(f"**{persona}**\n\n{roles_str}")
-                        else:
-                            cols_dash[i % 3].success(f"**{persona}**\n\n{roles_str}")
-                else:
-                    st.warning("Nadie asignado aún.")
-                
-                st.markdown("---")
-                
-                # --- LÓGICA DE EXCLUSIÓN INTELIGENTE PARA LOS DESPLEGABLES ---
-                asignados_vym = {k: v for k, v in asignados_dict.items() if k.startswith("vym_")}
-                asignados_fds = {k: v for k, v in asignados_dict.items() if k.startswith("fds_")}
-                asignados_av = {k: v for k, v in asignados_dict.items() if k.startswith("av_")}
-
-                def obtener_excluidos(prefix_actual, rol_actual):
-                    excluidos = set()
-                    es_rol_exclusivo = lambda r: "Presidente" in r or "Acomodador Entrada" in r
+                    asignados_actuales = set(asignados_dict.values())
                     
-                    if prefix_actual == "vym":
-                        excluidos.update(v for k, v in asignados_vym.items() if k != f"vym_{rol_actual}")
-                    elif prefix_actual == "fds":
-                        excluidos.update(v for k, v in asignados_fds.items() if k != f"fds_{rol_actual}")
+                    if asignados_actuales:
+                        st.info(f"**{len(asignados_actuales)} hermanos asignados para esta semana:**")
                         
-                    if prefix_actual != "av":
-                        excluidos.update(asignados_av.values())
+                        persona_roles = {}
+                        for cat_name, cat_dict, prefix in [("A.y V.", ROLES_AV, "av"), ("V.y M.", ROLES_VYM, "vym"), ("F.de Sem.", ROLES_FDS, "fds")]:
+                            for rol in cat_dict.keys():
+                                val = asignados_dict.get(f'{prefix}_{rol}', "")
+                                if val:
+                                    if val not in persona_roles:
+                                        persona_roles[val] = []
+                                    persona_roles[val].append(f"*{limpiar_texto_rol(rol)} ({cat_name})*")
+                        
+                        cols_dash = st.columns(3)
+                        for i, (persona, roles) in enumerate(persona_roles.items()):
+                            roles_str = " | ".join(roles)
+                            if len(roles) > 1:
+                                cols_dash[i % 3].error(f"**{persona}**\n\n{roles_str}")
+                            else:
+                                cols_dash[i % 3].success(f"**{persona}**\n\n{roles_str}")
                     else:
-                        excluidos.update(asignados_vym.values())
-                        excluidos.update(asignados_fds.values())
-                        excluidos.update(v for k, v in asignados_av.items() if k != f"av_{rol_actual}")
+                        st.warning("Nadie asignado aún.")
+                    
+                    st.markdown("---")
+                    
+                    # --- LÓGICA DE EXCLUSIÓN INTELIGENTE PARA LOS DESPLEGABLES ---
+                    asignados_vym = {k: v for k, v in asignados_dict.items() if k.startswith("vym_")}
+                    asignados_fds = {k: v for k, v in asignados_dict.items() if k.startswith("fds_")}
+                    asignados_av = {k: v for k, v in asignados_dict.items() if k.startswith("av_")}
 
-                    if prefix_actual == "vym":
-                        for r_fds, persona in asignados_fds.items():
-                            if es_rol_exclusivo(r_fds): excluidos.add(persona)
-                        if es_rol_exclusivo(rol_actual): excluidos.update(asignados_fds.values())
-                    elif prefix_actual == "fds":
-                        for r_vym, persona in asignados_vym.items():
-                            if es_rol_exclusivo(r_vym): excluidos.add(persona)
-                        if es_rol_exclusivo(rol_actual): excluidos.update(asignados_vym.values())
+                    def obtener_excluidos(prefix_actual, rol_actual):
+                        excluidos = set()
+                        es_rol_exclusivo = lambda r: "Presidente" in r or "Acomodador Entrada" in r
+                        
+                        if prefix_actual == "vym":
+                            excluidos.update(v for k, v in asignados_vym.items() if k != f"vym_{rol_actual}")
+                        elif prefix_actual == "fds":
+                            excluidos.update(v for k, v in asignados_fds.items() if k != f"fds_{rol_actual}")
                             
-                    return excluidos
+                        if prefix_actual != "av":
+                            excluidos.update(asignados_av.values())
+                        else:
+                            excluidos.update(asignados_vym.values())
+                            excluidos.update(asignados_fds.values())
+                            excluidos.update(v for k, v in asignados_av.items() if k != f"av_{rol_actual}")
 
-                with st.expander("🎛️ Audio y Video (Semana Completa)", expanded=True):
-                    c1, c2 = st.columns(2)
-                    for idx, (rol, calif) in enumerate(ROLES_AV.items()):
-                        asignados_otros = obtener_excluidos("av", rol)
-                        opc_base, rec = obtener_opciones_combo_inteligente(calif, asignados_otros)
-                        opc = opc_base + rec
-                        widget_key = f'borrador_av_{rol}_{st.session_state.current_week}'
-                        val = st.session_state.get(widget_key, st.session_state.get(f'borrador_av_{rol}', ""))
-                        idx_default = opc.index(val) if val in opc else 0
-                        seleccion = (c1 if idx % 2 == 0 else c2).selectbox(
-                            f"**{limpiar_texto_rol(rol)}**", 
-                            options=opc, 
-                            index=idx_default, 
-                            key=widget_key
-                        )
-                        st.session_state[f'borrador_av_{rol}'] = seleccion
+                        if prefix_actual == "vym":
+                            for r_fds, persona in asignados_fds.items():
+                                if es_rol_exclusivo(r_fds): excluidos.add(persona)
+                            if es_rol_exclusivo(rol_actual): excluidos.update(asignados_fds.values())
+                        elif prefix_actual == "fds":
+                            for r_vym, persona in asignados_vym.items():
+                                if es_rol_exclusivo(r_vym): excluidos.add(persona)
+                            if es_rol_exclusivo(rol_actual): excluidos.update(asignados_vym.values())
+                                
+                        return excluidos
 
-                with st.expander("💼 Reunión Vida y Ministerio", expanded=True):
-                    c1, c2 = st.columns(2)
-                    for idx, (rol, calif) in enumerate(ROLES_VYM.items()):
-                        asignados_otros = obtener_excluidos("vym", rol)
-                        opc_base, rec = obtener_opciones_combo_inteligente(calif, asignados_otros)
-                        opc = opc_base + rec
-                        widget_key = f'borrador_vym_{rol}_{st.session_state.current_week}'
-                        val = st.session_state.get(widget_key, st.session_state.get(f'borrador_vym_{rol}', ""))
-                        idx_default = opc.index(val) if val in opc else 0
-                        seleccion = (c1 if idx % 2 == 0 else c2).selectbox(
-                            f"**{limpiar_texto_rol(rol)}**", 
-                            options=opc, 
-                            index=idx_default, 
-                            key=widget_key
-                        )
-                        st.session_state[f'borrador_vym_{rol}'] = seleccion
+                    with st.expander("🎛️ Audio y Video (Semana Completa)", expanded=True):
+                        c1, c2 = st.columns(2)
+                        for idx, (rol, calif) in enumerate(ROLES_AV.items()):
+                            asignados_otros = obtener_excluidos("av", rol)
+                            opc_base, rec = obtener_opciones_combo_inteligente(calif, asignados_otros)
+                            opc = opc_base + rec
+                            widget_key = f'borrador_av_{rol}_{st.session_state.current_week}'
+                            val = st.session_state.get(widget_key, st.session_state.get(f'borrador_av_{rol}', ""))
+                            idx_default = opc.index(val) if val in opc else 0
+                            seleccion = (c1 if idx % 2 == 0 else c2).selectbox(
+                                f"**{limpiar_texto_rol(rol)}**", 
+                                options=opc, 
+                                index=idx_default, 
+                                key=widget_key
+                            )
+                            st.session_state[f'borrador_av_{rol}'] = seleccion
 
-                with st.expander("⛪ Reunión de Fin de Semana", expanded=True):
-                    c1, c2 = st.columns(2)
-                    for idx, (rol, calif) in enumerate(ROLES_FDS.items()):
-                        asignados_otros = obtener_excluidos("fds", rol)
-                        opc_base, rec = obtener_opciones_combo_inteligente(calif, asignados_otros)
-                        opc = opc_base + rec
-                        widget_key = f'borrador_fds_{rol}_{st.session_state.current_week}'
-                        val = st.session_state.get(widget_key, st.session_state.get(f'borrador_fds_{rol}', ""))
-                        idx_default = opc.index(val) if val in opc else 0
-                        seleccion = (c1 if idx % 2 == 0 else c2).selectbox(
-                            f"**{limpiar_texto_rol(rol)}**", 
-                            options=opc, 
-                            index=idx_default, 
-                            key=widget_key
-                        )
-                        st.session_state[f'borrador_fds_{rol}'] = seleccion
+                    with st.expander("💼 Reunión Vida y Ministerio", expanded=True):
+                        c1, c2 = st.columns(2)
+                        for idx, (rol, calif) in enumerate(ROLES_VYM.items()):
+                            asignados_otros = obtener_excluidos("vym", rol)
+                            opc_base, rec = obtener_opciones_combo_inteligente(calif, asignados_otros)
+                            opc = opc_base + rec
+                            widget_key = f'borrador_vym_{rol}_{st.session_state.current_week}'
+                            val = st.session_state.get(widget_key, st.session_state.get(f'borrador_vym_{rol}', ""))
+                            idx_default = opc.index(val) if val in opc else 0
+                            seleccion = (c1 if idx % 2 == 0 else c2).selectbox(
+                                f"**{limpiar_texto_rol(rol)}**", 
+                                options=opc, 
+                                index=idx_default, 
+                                key=widget_key
+                            )
+                            st.session_state[f'borrador_vym_{rol}'] = seleccion
 
+                    with st.expander("⛪ Reunión de Fin de Semana", expanded=True):
+                        c1, c2 = st.columns(2)
+                        for idx, (rol, calif) in enumerate(ROLES_FDS.items()):
+                            asignados_otros = obtener_excluidos("fds", rol)
+                            opc_base, rec = obtener_opciones_combo_inteligente(calif, asignados_otros)
+                            opc = opc_base + rec
+                            widget_key = f'borrador_fds_{rol}_{st.session_state.current_week}'
+                            val = st.session_state.get(widget_key, st.session_state.get(f'borrador_fds_{rol}', ""))
+                            idx_default = opc.index(val) if val in opc else 0
+                            seleccion = (c1 if idx % 2 == 0 else c2).selectbox(
+                                f"**{limpiar_texto_rol(rol)}**", 
+                                options=opc, 
+                                index=idx_default, 
+                                key=widget_key
+                            )
+                            st.session_state[f'borrador_fds_{rol}'] = seleccion
+
+                    st.markdown("---")
+
+                    # --- PREVISUALIZACIÓN DE LA SEMANA ACTUAL ANTES DE CONFIRMAR ---
+                    with st.expander(f"👁️ Previsualización de las Asignaciones — Semana {st.session_state.current_week} (Verificar antes de confirmar)", expanded=True):
+                        st.caption("Así quedará el cuadro de asignaciones de esta semana. Si observas algún error, cámbialo arriba en los desplegables antes de confirmar.")
+                        f_vym_prev = obtener_fecha_espanol(fecha_vym_actual)
+                        f_fds_prev = obtener_fecha_espanol(fecha_fds_actual)
+                        f_av_prev = f"Semana del {f_vym_prev}"
+                        d_vym_prev = {k: st.session_state.get(f'borrador_vym_{k}', '') for k in ROLES_VYM.keys()}
+                        d_fds_prev = {k: st.session_state.get(f'borrador_fds_{k}', '') for k in ROLES_FDS.keys()}
+                        d_av_prev = {k: st.session_state.get(f'borrador_av_{k}', '') for k in ROLES_AV.keys()}
+                        mostrar_previsualizacion_semana(f_vym_prev, d_vym_prev, f_fds_prev, d_fds_prev, f_av_prev, d_av_prev)
+
+                    # Check for "-- Seleccionar Manualmente --"
+                    faltan = []
+                    for cat_dict, prefix, cat_name in [(ROLES_AV, "av", "A. y V."), (ROLES_VYM, "vym", "V. y M."), (ROLES_FDS, "fds", "F. de Sem.")]:
+                        for rol in cat_dict.keys():
+                            val = st.session_state.get(f'borrador_{prefix}_{rol}', "")
+                            if val == "-- Seleccionar Manualmente --":
+                                faltan.append(f"{limpiar_texto_rol(rol)} ({cat_name})")
+                    
+                    if faltan:
+                        st.warning(f"⚠️ Atención: Faltan por asignar los siguientes privilegios: {', '.join(faltan)}. Selecciona un hermano o elige 'Ninguno (Dejar en blanco)'.")
+                    
+                    if st.button(f"💾 Confirmar Semana {st.session_state.current_week} y Continuar", type="primary", use_container_width=True, disabled=len(faltan) > 0):
+                        confirmar_y_avanzar_semana(fecha_vym_actual, fecha_fds_actual)
+                        st.rerun()
+
+                _render_paso3_revisar_y_editar(fecha_vym, fecha_fds)
+
+            if st.session_state.history_vym:
                 st.markdown("---")
-                
-                # Check for "-- Seleccionar Manualmente --"
-                faltan = []
-                for cat_dict, prefix, cat_name in [(ROLES_AV, "av", "A. y V."), (ROLES_VYM, "vym", "V. y M."), (ROLES_FDS, "fds", "F. de Sem.")]:
-                    for rol in cat_dict.keys():
-                        val = st.session_state.get(f'borrador_{prefix}_{rol}', "")
-                        if val == "-- Seleccionar Manualmente --":
-                            faltan.append(f"{limpiar_texto_rol(rol)} ({cat_name})")
-                
-                if faltan:
-                    st.warning(f"⚠️ Atención: Faltan por asignar los siguientes privilegios: {', '.join(faltan)}. Selecciona un hermano o elige 'Ninguno (Dejar en blanco)'.")
-                
-                if st.button(f"💾 Confirmar Semana {st.session_state.current_week} y Continuar", type="primary", use_container_width=True, disabled=len(faltan) > 0):
-                    confirmar_y_avanzar_semana(fecha_vym, fecha_fds)
-                    st.rerun()
+                st.markdown("#### 📋 Semanas Anteriores ya Confirmadas (Previsualizar / Corregir)")
+                render_panel_previsualizacion_y_correccion_historial(expandir_por_defecto=False)
 
     elif st.session_state.plan_mode == "completed":
         st.balloons()
         st.success(f"🎉 ¡Proceso finalizado! Se han planificado {st.session_state.target_weeks} semanas correctamente.")
+
+        st.markdown("### 👁️ Previsualización de Asignaciones y Corrección de Errores")
+        st.info("Revisa aquí cómo quedaron todas las asignaciones de la semana. Si detectas algún error, despliega **'✏️ Corregir / Modificar Asignaciones'**, realiza el cambio y presiona **Guardar Corrección** antes de descargar los PDFs.")
+        render_panel_previsualizacion_y_correccion_historial(expandir_por_defecto=True)
+
+        st.markdown("---")
         st.markdown("### 📥 Descargar Archivos")
         st.info("Descarga aquí tu archivo unificado para el tablero físico, y adicionalmente el reporte exclusivo de Audio y Video.")
         
@@ -878,29 +1064,33 @@ if st.session_state.role == "admin":
             st.bar_chart(data=df_sorted, x="Nombre", y="Total_Asignaciones", color="#319795")
             
             st.subheader("Asignaciones por Mes")
-            meses_disponibles = set()
-            for hist in df_m.get('historial_meses', []):
-                if isinstance(hist, dict):
-                    meses_disponibles.update(hist.keys())
-            
-            if meses_disponibles:
-                meses_disponibles = sorted(list(meses_disponibles), reverse=True)
-                mes_seleccionado = st.selectbox("Seleccione el mes (Año-Mes)", meses_disponibles)
+            @_fragment
+            def _render_estadisticas_mes(df_m_local):
+                meses_disponibles = set()
+                for hist in df_m_local.get('historial_meses', []):
+                    if isinstance(hist, dict):
+                        meses_disponibles.update(hist.keys())
                 
-                df_mes = df_m[['Nombre']].copy()
-                df_mes['Asignaciones_Este_Mes'] = df_m['historial_meses'].apply(
-                    lambda x: x.get(mes_seleccionado, 0) if isinstance(x, dict) else 0
-                )
-                # Filtrar solo los que tuvieron asignaciones ese mes
-                df_mes = df_mes[df_mes['Asignaciones_Este_Mes'] > 0].sort_values(by="Asignaciones_Este_Mes", ascending=False)
-                
-                if not df_mes.empty:
-                    st.dataframe(df_mes, use_container_width=True, hide_index=True)
-                    st.bar_chart(data=df_mes, x="Nombre", y="Asignaciones_Este_Mes", color="#F6AD55")
+                if meses_disponibles:
+                    meses_disponibles = sorted(list(meses_disponibles), reverse=True)
+                    mes_seleccionado = st.selectbox("Seleccione el mes (Año-Mes)", meses_disponibles)
+                    
+                    df_mes = df_m_local[['Nombre']].copy()
+                    df_mes['Asignaciones_Este_Mes'] = df_m_local['historial_meses'].apply(
+                        lambda x: x.get(mes_seleccionado, 0) if isinstance(x, dict) else 0
+                    )
+                    # Filtrar solo los que tuvieron asignaciones ese mes
+                    df_mes = df_mes[df_mes['Asignaciones_Este_Mes'] > 0].sort_values(by="Asignaciones_Este_Mes", ascending=False)
+                    
+                    if not df_mes.empty:
+                        st.dataframe(df_mes, use_container_width=True, hide_index=True)
+                        st.bar_chart(data=df_mes, x="Nombre", y="Asignaciones_Este_Mes", color="#F6AD55")
+                    else:
+                        st.info(f"No hay asignaciones registradas en {mes_seleccionado}.")
                 else:
-                    st.info(f"No hay asignaciones registradas en {mes_seleccionado}.")
-            else:
-                st.info("Aún no hay registros de asignaciones por mes. A medida que confirmes semanas, irán apareciendo aquí.")
+                    st.info("Aún no hay registros de asignaciones por mes. A medida que confirmes semanas, irán apareciendo aquí.")
+
+            _render_estadisticas_mes(df_m)
 
     with tab4:
         st.header("🛠️ Panel de Administración")

@@ -752,7 +752,135 @@ def generar_pdf_solo_av(lista_datos_semanas):
     buffer.seek(0)
     return buffer
 
-def reiniciar_planificacion():
+def reiniciar_semana_actual():
+    """Reinicia únicamente el borrador y archivo de la semana que se está planificando actualmente."""
+    wk = st.session_state.current_week
+    st.session_state.draft_ready = False
+    st.session_state.texto_programa = ""
+    st.session_state.nombres_detectados_vm = []
+    st.session_state.ultimo_archivo_id = None
+    st.session_state.reset_counter = st.session_state.get("reset_counter", 0) + 1
+    for prefix, cat_dict in [("av", ROLES_AV), ("vym", ROLES_VYM), ("fds", ROLES_FDS)]:
+        for rol in cat_dict.keys():
+            st.session_state.pop(f"borrador_{prefix}_{rol}", None)
+            st.session_state.pop(f"borrador_{prefix}_{rol}_{wk}", None)
+
+def regresar_a_semana_anterior_en_planificador():
+    """Revierte la última semana confirmada del bloque actual y la vuelve a abrir en el Paso 3 del planificador."""
+    if not st.session_state.history_vym:
+        st.session_state.plan_mode = "setup"
+        return
+
+    _, dict_vym_ant = st.session_state.history_vym.pop()
+    _, dict_fds_ant = st.session_state.history_fds.pop()
+    _, dict_av_ant = st.session_state.history_av.pop()
+    mes_key = (
+        st.session_state.history_mes_keys.pop()
+        if st.session_state.history_mes_keys
+        else f"{datetime.date.today().year}-{datetime.date.today().month:02d}"
+    )
+
+    df = st.session_state.participants
+    if 'historial_meses' not in df.columns:
+        df['historial_meses'] = [{} for _ in range(len(df))]
+
+    conteo_revertir = {}
+    for d in (dict_vym_ant, dict_fds_ant, dict_av_ant):
+        for n in d.values():
+            if n and n not in ["-- Seleccionar Manualmente --", "Ninguno (Dejar en blanco)"]:
+                conteo_revertir[n] = conteo_revertir.get(n, 0) + 1
+
+    if conteo_revertir:
+        batch = db.batch()
+        hubo_cambios = False
+        for persona, cant in conteo_revertir.items():
+            mask = df['Nombre'] == persona
+            if mask.any():
+                idx = df[mask].index[0]
+                nuevo_total = max(0, int(df.at[idx, 'Total_Asignaciones']) - cant)
+                df.at[idx, 'Total_Asignaciones'] = nuevo_total
+                hist = df.at[idx, 'historial_meses']
+                if not isinstance(hist, dict):
+                    hist = {}
+                else:
+                    hist = dict(hist)
+                nuevo_mes = max(0, int(hist.get(mes_key, 0)) - cant)
+                if nuevo_mes > 0:
+                    hist[mes_key] = nuevo_mes
+                else:
+                    hist.pop(mes_key, None)
+                df.at[idx, 'historial_meses'] = hist
+                row_dict = df.loc[idx].to_dict()
+                doc_id = row_dict['Nombre'].replace(' ', '_').replace('/', '_')
+                batch.set(db.collection('participantes').document(doc_id), row_dict)
+                hubo_cambios = True
+        if hubo_cambios:
+            batch.commit()
+            _fetch_participants_data.clear()
+            st.session_state.participants = df
+
+    st.session_state.current_week = max(1, st.session_state.current_week - 1)
+    wk = st.session_state.current_week
+    st.session_state.default_vym_date = st.session_state.default_vym_date - datetime.timedelta(days=7)
+    st.session_state.default_fds_date = st.session_state.default_fds_date - datetime.timedelta(days=7)
+
+    for rol, val in dict_av_ant.items():
+        st.session_state[f'borrador_av_{rol}'] = val
+        st.session_state[f'borrador_av_{rol}_{wk}'] = val
+    for rol, val in dict_vym_ant.items():
+        st.session_state[f'borrador_vym_{rol}'] = val
+        st.session_state[f'borrador_vym_{rol}_{wk}'] = val
+    for rol, val in dict_fds_ant.items():
+        st.session_state[f'borrador_fds_{rol}'] = val
+        st.session_state[f'borrador_fds_{rol}_{wk}'] = val
+
+    st.session_state.draft_ready = True
+    st.session_state.plan_mode = "planning"
+
+def reiniciar_planificacion(revertir_confirmadas=False):
+    """Reinicia el planificador y regresa a la selección inicial de semanas. Si revertir_confirmadas=True, descuenta de Firebase las semanas confirmadas en el bloque interrumpido."""
+    if revertir_confirmadas and st.session_state.history_vym:
+        df = st.session_state.participants
+        if 'historial_meses' not in df.columns:
+            df['historial_meses'] = [{} for _ in range(len(df))]
+
+        personas_modificadas = set()
+        for idx_s in range(len(st.session_state.history_vym)):
+            _, d_vym = st.session_state.history_vym[idx_s]
+            _, d_fds = st.session_state.history_fds[idx_s]
+            _, d_av = st.session_state.history_av[idx_s]
+            mes_k = (
+                st.session_state.history_mes_keys[idx_s]
+                if idx_s < len(st.session_state.history_mes_keys)
+                else f"{datetime.date.today().year}-{datetime.date.today().month:02d}"
+            )
+            for d in (d_vym, d_fds, d_av):
+                for persona in d.values():
+                    if persona and persona not in ["-- Seleccionar Manualmente --", "Ninguno (Dejar en blanco)"]:
+                        mask = df['Nombre'] == persona
+                        if mask.any():
+                            idx = df[mask].index[0]
+                            df.at[idx, 'Total_Asignaciones'] = max(0, int(df.at[idx, 'Total_Asignaciones']) - 1)
+                            hist = df.at[idx, 'historial_meses']
+                            hist = dict(hist) if isinstance(hist, dict) else {}
+                            nv = max(0, int(hist.get(mes_k, 0)) - 1)
+                            if nv > 0:
+                                hist[mes_k] = nv
+                            else:
+                                hist.pop(mes_k, None)
+                            df.at[idx, 'historial_meses'] = hist
+                            personas_modificadas.add(idx)
+
+        if personas_modificadas:
+            batch = db.batch()
+            for idx in personas_modificadas:
+                row_dict = df.loc[idx].to_dict()
+                doc_id = row_dict['Nombre'].replace(' ', '_').replace('/', '_')
+                batch.set(db.collection('participantes').document(doc_id), row_dict)
+            batch.commit()
+            _fetch_participants_data.clear()
+            st.session_state.participants = df
+
     st.session_state.plan_mode = "setup"
     st.session_state.target_weeks = 1
     st.session_state.current_week = 1
@@ -764,6 +892,10 @@ def reiniciar_planificacion():
     st.session_state.texto_programa = ""
     st.session_state.nombres_detectados_vm = []
     st.session_state.ultimo_archivo_id = None
+    st.session_state.reset_counter = st.session_state.get("reset_counter", 0) + 1
+    keys_borrar = [k for k in st.session_state.keys() if k.startswith("borrador_")]
+    for k in keys_borrar:
+        st.session_state.pop(k, None)
 
 # -----------------------------------------------------------------------------
 # INTERFAZ GRÁFICA DE USUARIO (UI)
@@ -790,7 +922,25 @@ with tab1:
             st.rerun()
 
     elif st.session_state.plan_mode == "planning":
-        st.subheader(f"🔄 Planificando Semana {st.session_state.current_week} de {st.session_state.target_weeks}")
+        c_head, c_btn_sem, c_btn_ant, c_btn_inicio = st.columns([2.2, 1.2, 1.2, 1.4])
+        with c_head:
+            st.subheader(f"🔄 Planificando Semana {st.session_state.current_week} de {st.session_state.target_weeks}")
+        with c_btn_sem:
+            if st.button("🔄 Reiniciar Semana Actual", use_container_width=True, help="Limpia el borrador y archivo de esta semana para volver a generarla desde cero."):
+                reiniciar_semana_actual()
+                st.toast("Semana actual reiniciada.", icon="🔄")
+                st.rerun()
+        with c_btn_ant:
+            if st.button("⬅️ Semana Anterior", use_container_width=True, disabled=len(st.session_state.history_vym) == 0, help="Regresa a la semana anterior en el planificador para editarla."):
+                regresar_a_semana_anterior_en_planificador()
+                st.toast("Regresaste a la semana anterior.", icon="⬅️")
+                st.rerun()
+        with c_btn_inicio:
+            if st.button("🛑 Suspender / Volver al Inicio", use_container_width=True, help="Suspende el trabajo actual y regresa al selector inicial de semanas."):
+                reiniciar_planificacion(revertir_confirmadas=True)
+                st.toast("Trabajo suspendido. Regresaste al inicio del planificador.", icon="🛑")
+                st.rerun()
+
         st.progress(st.session_state.current_week / st.session_state.target_weeks)
         
         col_izq, col_der = st.columns([1, 1.8])
@@ -801,12 +951,13 @@ with tab1:
             fecha_fds = st.date_input("📅 Fecha Fin de Semana:", value=st.session_state.default_fds_date, format="DD/MM/YYYY")
             
             st.markdown("---")
-            archivo_vm = st.file_uploader("📄 Subir Programa V. y M. (PDF/Imagen)", type=["pdf", "csv", "txt", "png", "jpg", "jpeg"], key=f"file_{st.session_state.current_week}")
+            rst_cnt = st.session_state.get("reset_counter", 0)
+            archivo_vm = st.file_uploader("📄 Subir Programa V. y M. (PDF/Imagen)", type=["pdf", "csv", "txt", "png", "jpg", "jpeg"], key=f"file_{st.session_state.current_week}_{rst_cnt}")
             
             nombres_activos = st.session_state.participants[st.session_state.participants["Activo"] == True]['Nombre'].tolist()
             
             if archivo_vm:
-                archivo_id = f"{archivo_vm.name}_{archivo_vm.size}_{st.session_state.current_week}"
+                archivo_id = f"{archivo_vm.name}_{archivo_vm.size}_{st.session_state.current_week}_{rst_cnt}"
                 if st.session_state.get("ultimo_archivo_id") != archivo_id:
                     st.session_state.texto_programa = extraer_texto_archivo(archivo_vm)
                     texto_norm = normalizar_texto(st.session_state.texto_programa)
@@ -819,7 +970,7 @@ with tab1:
                 "Personas excluidas para esta semana (No se les asignará nada):", 
                 options=nombres_activos, 
                 default=st.session_state.nombres_detectados_vm,
-                key=f"excl_{st.session_state.current_week}"
+                key=f"excl_{st.session_state.current_week}_{rst_cnt}"
             )
             
             if st.button("🚀 Paso 2: Generar Borrador de esta Semana", type="primary", use_container_width=True):
@@ -984,6 +1135,16 @@ with tab1:
                         confirmar_y_avanzar_semana(fecha_vym_actual, fecha_fds_actual)
                         st.rerun()
 
+                    c_b1, c_b2 = st.columns(2)
+                    with c_b1:
+                        if st.button("🔄 Reiniciar Borrador de esta Semana", key="btn_rst_paso3", use_container_width=True):
+                            reiniciar_semana_actual()
+                            st.rerun()
+                    with c_b2:
+                        if st.button("🛑 Suspender Trabajo y Volver al Inicio", key="btn_susp_paso3", use_container_width=True):
+                            reiniciar_planificacion(revertir_confirmadas=True)
+                            st.rerun()
+
                 _render_paso3_revisar_y_editar(fecha_vym, fecha_fds)
 
             if st.session_state.history_vym:
@@ -1013,9 +1174,19 @@ with tab1:
             st.download_button(label="🎧 Descargar PDF Exclusivo Audio y Video", data=pdf_av_only, file_name="Programa_Solo_Audio_Video.pdf", mime="application/pdf", use_container_width=True)
         
         st.markdown("---")
-        if st.button("🔄 Volver al Inicio (Planificar nuevo bloque)", use_container_width=True):
-            reiniciar_planificacion()
-            st.rerun()
+        c_fin1, c_fin2, c_fin3 = st.columns(3)
+        with c_fin1:
+            if st.button("⬅️ Regresar al Planificador de Semanas", use_container_width=True, help="Vuelve a abrir la última semana en el Paso 3 del planificador para editarla."):
+                regresar_a_semana_anterior_en_planificador()
+                st.rerun()
+        with c_fin2:
+            if st.button("🔄 Volver al Inicio (Planificar nuevo bloque)", type="primary", use_container_width=True, help="Conserva las semanas guardadas y regresa al selector inicial para planificar un nuevo bloque."):
+                reiniciar_planificacion(revertir_confirmadas=False)
+                st.rerun()
+        with c_fin3:
+            if st.button("🗑️ Reiniciar / Anular este Bloque", use_container_width=True, help="Descarta por completo el bloque recién creado, revierte sus asignaciones y vuelve al inicio."):
+                reiniciar_planificacion(revertir_confirmadas=True)
+                st.rerun()
 
 if st.session_state.role == "admin":
     tab2 = tabs[1]
